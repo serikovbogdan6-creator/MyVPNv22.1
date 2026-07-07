@@ -14,12 +14,6 @@ import winreg
 from pathlib import Path
 from typing import Optional
 
-# ВАЖНО: должно быть выставлено ДО импорта QtWebEngine и ДО создания
-# QApplication. Раньше здесь принудительно отключался GPU
-# (--disable-gpu и т.п.) — это и было причиной сильных лагов интерфейса,
-# т.к. весь рендеринг (включая тени/скругления) шёл на CPU. Теперь GPU
-# отключается только если явно попросили через переменную окружения —
-# например, если приложение падает на конкретной VPS/RDP-машине.
 os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 if os.environ.get("INTOURIST_FORCE_SOFTWARE_RENDER") == "1":
     os.environ.setdefault(
@@ -32,7 +26,7 @@ import requests
 try:
     import psutil
 except ImportError:
-    psutil = None  # счётчики трафика будут показывать "н/д", если psutil не установлен
+    psutil = None
 
 from PyQt6.QtCore import QThread, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QPalette, QColor, QIcon
@@ -63,13 +57,10 @@ def _install_crash_safety_net():
                 f.write("\n")
         except Exception:
             pass
-        # выводим и в консоль/лог виджет, если получится
         traceback.print_exception(exc_type, exc_value, exc_tb)
 
     sys.excepthook = handle_exception
 
-
-# ────────────────────────────── служебное ───────────────────────────────
 
 def _ensure_admin():
     try:
@@ -92,10 +83,8 @@ def _ensure_admin():
 def _resolve_base() -> Path:
     """Найти базовую папку (где мы ищем ресурсы)."""
     if getattr(sys, "frozen", False):
-        # Собранный exe (PyInstaller onedir)
         exe_dir = Path(sys.executable).resolve().parent
         return exe_dir
-    # Разработка — рядом с файлом скрипта
     return Path(__file__).resolve().parent
 
 
@@ -117,21 +106,60 @@ def _find_ui_file() -> Optional[Path]:
     return None
 
 
-
 def _exe_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
 
 
-# ────────────────────────── история ссылок (память программы) ────────────
+# ────────────────────────── сохранение состояния ────────────────────────
 
 MAX_LINK_HISTORY = 10
 
 
+def _state_file_path() -> Path:
+    """Файл, в котором сохраняются состояние приложения между запусками."""
+    base = os.environ.get("APPDATA")
+    root = Path(base) if base else Path.home()
+    d = root / "IntouristVPN"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        d = _exe_dir()
+    return d / "app_state.json"
+
+
+def _load_app_state() -> dict:
+    """Загружает состояние приложения из файла."""
+    try:
+        path = _state_file_path()
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {
+        "link_history": [],
+        "servers": [],
+        "last_selected_host": "",
+    }
+
+
+def _save_app_state(state: dict):
+    """Сохраняет состояние приложения в файл."""
+    try:
+        path = _state_file_path()
+        path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
 def _link_history_path() -> Path:
-    """Файл, в котором между запусками программы хранятся ранее введённые
-    ссылки-подписки/URI, чтобы не вводить их заново."""
+    """Файл, в котором между запусками программы хранятся ранее введённые ссылки."""
     base = os.environ.get("APPDATA")
     root = Path(base) if base else Path.home()
     d = root / "IntouristVPN"
@@ -220,25 +248,42 @@ _COUNTRY_NAME_HINTS = {
 
 
 def _guess_country(name: str, host: str) -> Optional[str]:
-    """Пытается угадать код страны по названию/хосту сервера, чтобы
-    показать корректный флаг в списке (многие подписки кладут страну
-    прямо в название сервера)."""
+    """Пытается угадать код страны по названию/хосту сервера.
+    Использует fallback для гарантии результата."""
     text = f"{name} {host}".lower()
+    
     # эмодзи-флаг (пара regional indicator symbols) прямо в названии
     for ch1, ch2 in zip(text, text[1:]):
         if "\U0001F1E6" <= ch1 <= "\U0001F1FF" and "\U0001F1E6" <= ch2 <= "\U0001F1FF":
             code = chr(ord(ch1) - 0x1F1E6 + ord("a")) + chr(ord(ch2) - 0x1F1E6 + ord("a"))
             if code in _COUNTRY_NAME_HINTS:
                 return code
+    
+    # Поиск по подстроке с высокой приоритетностью для точных совпадений
+    for code, hints in _COUNTRY_NAME_HINTS.items():
+        # Сначала ищем точное совпадение слова
+        for hint in hints:
+            if f" {hint} " in f" {text} " or text.startswith(hint) or text.endswith(hint):
+                return code
+    
+    # Затем обычный поиск подстроки
     for code, hints in _COUNTRY_NAME_HINTS.items():
         if any(h in text for h in hints):
             return code
         if f".{code}" in host.lower() or host.lower().endswith(code):
             return code
-    return None
+    
+    # Fallback: пытаемся извлечь код из TLD хоста
+    if "." in host:
+        parts = host.split(".")
+        potential_code = parts[-1].lower()
+        if potential_code in _COUNTRY_NAME_HINTS:
+            return potential_code
+    
+    return None  # Fallback: будет использоваться DEFAULT_FLAG в UI
 
 
-# ────────────────────────────── парсинг подписок ─────────────────────────
+# ────────────────────────── парсинг подписок ────────────────────────────
 
 def parse_uri(uri: str) -> Optional[dict]:
     uri = uri.strip()
@@ -313,7 +358,7 @@ def parse_subscription(raw: str) -> list[dict]:
     return servers
 
 
-# ────────────────────────────── воркеры ──────────────────────────────────
+# ────────────────────────── воркеры ─────────────────────────────────────
 
 class SubWorker(QThread):
     done = pyqtSignal(list)
@@ -336,10 +381,6 @@ class SubWorker(QThread):
 class PingWorker(QThread):
     result = pyqtSignal(int, int)
 
-    # curl умеет измерять именно время установки TCP-соединения
-    # (%{time_connect}) не тратя время на прикладной протокол — этого
-    # достаточно, чтобы получить честный "пинг" до сервера независимо
-    # от того, что именно слушает на этом порту (VLESS/Trojan/VMess/SS).
     CURL_TIMEOUT_SEC = 6
 
     def __init__(self, index: int, host: str, port: int):
@@ -379,7 +420,6 @@ class PingWorker(QThread):
         return None
 
     def _ping_via_socket(self) -> Optional[int]:
-        # Резервный вариант — если curl недоступен в системе/PATH.
         try:
             t0 = time.monotonic()
             with socket.create_connection((self.host, self.port), timeout=5):
@@ -399,8 +439,6 @@ class VpnWorker(QThread):
         "myvpn connected", "socks5 ready", "upstream connected",
         "tun2socks: started", "xray", "started",
     )
-    # Не все бинарники печатают одинаковые фразы в лог — если процесс всё
-    # ещё жив спустя это время, считаем подключение установленным.
     READY_TIMEOUT_SEC = 3.0
 
     def __init__(self, cmd: list[str]):
@@ -471,7 +509,7 @@ class VpnWorker(QThread):
                     pass
 
 
-# ────────────────────────────── главное окно ─────────────────────────────
+# ────────────────────────── главное окно ────────────────────────────────
 
 class MainWindow(QMainWindow):
     BASE = _resolve_base()
@@ -492,9 +530,14 @@ class MainWindow(QMainWindow):
         self._dns_adapters: list[str] = []
         self._servers: list[dict] = [HELPER_SERVER]
         self._connection_time = 0
-        self._net_baseline = None  # снимок psutil.net_io_counters() на момент подключения
+        self._net_baseline = None
         self._link_history: list[str] = _load_link_history()
         self._pending_sub_link: Optional[str] = None
+        self._disconnect_in_progress = False  # Флаг для синхронизации отключения
+        self._state_lock = threading.Lock()  # Mutex для защиты состояния
+
+        # Загружаем сохраненное состояние
+        self._load_saved_state()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -543,18 +586,41 @@ Exe: {Path(sys.executable)}
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
-        # Автоматический пинг всех серверов подписки каждые 30 секунд
-        # (через curl), плюс кнопка "Пинг" в интерфейсе для ручного запуска.
         self._ping_timer = QTimer(self)
         self._ping_timer.timeout.connect(self._on_auto_ping)
         self._ping_timer.start(30_000)
 
+    def _load_saved_state(self):
+        """Загружает сохраненное состояние приложения."""
+        try:
+            state = _load_app_state()
+            if state.get("servers"):
+                self._servers = [HELPER_SERVER] + state["servers"]
+                if state.get("last_selected_host"):
+                    self._bridge._last_selected_host = state["last_selected_host"]
+        except Exception:
+            pass
+
+    def _save_current_state(self):
+        """Сохраняет текущее состояние приложения."""
+        try:
+            with self._state_lock:
+                # Сохраняем только серверы из подписок (без Helper)
+                subscription_servers = [s for s in self._servers if s.get("kind") != "helper"]
+                state = {
+                    "link_history": self._link_history,
+                    "servers": subscription_servers,
+                    "last_selected_host": self._bridge._last_selected_host,
+                }
+                _save_app_state(state)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     def _on_page_loaded(self, ok: bool):
-        # публикуем начальный список серверов (только helper) после загрузки страницы
+        """Публикуем начальный список серверов после загрузки страницы."""
         self._bridge.setServers(self._servers)
         self._bridge.setStatus(False)
-        # восстанавливаем ранее сохранённые ссылки-подписки из памяти программы
         self._bridge.setLinkHistory(self._link_history)
 
     # ------------------------------------------------------------------
@@ -572,6 +638,7 @@ Exe: {Path(sys.executable)}
                 self._bridge.setServers(self._servers)
                 self._bridge.appendLog("[INFO] Сервер добавлен из URI.")
                 self._remember_link(text)
+                self._save_current_state()
                 self._start_pings()
             else:
                 self._bridge.appendLog("[ERROR] Не удалось разобрать URI.")
@@ -594,14 +661,14 @@ Exe: {Path(sys.executable)}
         if getattr(self, "_pending_sub_link", None):
             self._remember_link(self._pending_sub_link)
             self._pending_sub_link = None
+        self._save_current_state()
         self._start_pings()
 
     def _on_sub_error(self, msg: str):
         self._bridge.appendLog(f"[ERROR] Ошибка загрузки подписки: {msg}")
 
     def _remember_link(self, link: str):
-        """Сохраняет успешно использованную ссылку в память программы
-        (файл на диске), чтобы она была доступна и после перезапуска."""
+        """Сохраняет успешно использованную ссылку в памяти программы."""
         link = (link or "").strip()
         if not link:
             return
@@ -631,9 +698,10 @@ Exe: {Path(sys.executable)}
             self._ping_workers.append(w)
 
     def _on_ping(self, index: int, ms: int):
-        if 0 <= index < len(self._servers):
-            self._servers[index]["ping"] = ms
-            self._bridge.setServers(self._servers)
+        with self._state_lock:
+            if 0 <= index < len(self._servers):
+                self._servers[index]["ping"] = ms
+                self._bridge.setServers(self._servers)
 
     def _on_manual_ping(self):
         """Кнопка 'Пинг' в интерфейсе — проверка по требованию пользователя."""
@@ -641,7 +709,7 @@ Exe: {Path(sys.executable)}
 
     def _on_auto_ping(self):
         """Срабатывает каждые 30 секунд — автоматическая фоновая проверка."""
-        if len(self._servers) > 1:  # есть хотя бы один сервер, кроме helper
+        if len(self._servers) > 1:
             self._start_pings(announce=False)
 
     # ------------------------------------------------------------------
@@ -649,11 +717,16 @@ Exe: {Path(sys.executable)}
     # ------------------------------------------------------------------
     def _on_connect_requested(self, server: dict):
         try:
-            # Уже что-то подключено/подключается — сначала аккуратно
-            # отключаемся, чтобы можно было переключиться на другой сервер
-            # одним действием (двойной клик по строке сервера).
+            # Если уже подключено/подключается — сначала отключаемся
             if self._connected or (self._vpn_worker and self._vpn_worker.isRunning()):
+                self._bridge.appendLog("[INFO] Переключение на другой сервер...")
                 self._disconnect()
+                # Ждем полной очистки перед переподключением
+                timeout = 0
+                while (self._vpn_worker and self._vpn_worker.isRunning() or 
+                       self._disconnect_in_progress) and timeout < 50:
+                    time.sleep(0.1)
+                    timeout += 1
 
             if server.get("kind") == "helper":
                 self._do_connect_helper()
@@ -705,7 +778,9 @@ Exe: {Path(sys.executable)}
                 self._do_connect_helper()
                 return
 
-            self._bridge.setMode(f"Режим: {srv.get('protocol')} / {srv.get('name')}")
+            server_name = srv.get('name', 'Unknown')
+            protocol = srv.get('protocol', 'Unknown')
+            self._bridge.setMode(f"Режим: {protocol} / {server_name}")
             self._conn_mode = "sub"
             self._connection_time = 0
             self._timer.start(1000)
@@ -738,24 +813,26 @@ Exe: {Path(sys.executable)}
                 self._set_proxy(False)
                 self._bridge.appendLog("[INFO] Intourist VPN готов (helper, полный туннель).")
             self._set_dns(True)
+            self._save_current_state()
         except Exception as exc:
             self._bridge.appendLog(f"[ERROR] _on_vpn_ready: {exc}")
             self._log_crash()
 
     def _disconnect(self):
+        """Синхронная очистка всего состояния VPN."""
         try:
+            with self._state_lock:
+                self._disconnect_in_progress = True
+            
             if self._vpn_worker and self._vpn_worker.isRunning():
                 self._bridge.appendLog("[INFO] Остановка VPN-процесса...")
                 self._vpn_worker.stop()
                 if not self._vpn_worker.wait(5000):
-                    self._bridge.appendLog("[WARN] VPN-процесс не завершился в срок.")
+                    self._bridge.appendLog("[WARN] VPN-процесс не завершился в срок, принудительное завершение.")
         except Exception as exc:
             self._bridge.appendLog(f"[WARN] Ошибка при остановке процесса: {exc}")
         finally:
-            # Сброс прокси/DNS/состояния выполняем ВСЕГДА, даже если что-то
-            # пошло не так выше — иначе система может остаться с "битыми"
-            # сетевыми настройками, и любое следующее подключение будет
-            # выглядеть неработающим.
+            # Полностью очищаем состояние
             try:
                 self._set_proxy(False)
             except Exception:
@@ -764,11 +841,14 @@ Exe: {Path(sys.executable)}
                 self._set_dns(False)
             except Exception:
                 pass
-            self._conn_mode = None
+            with self._state_lock:
+                self._conn_mode = None
+                self._disconnect_in_progress = False
             self._update_status(False)
             self._bridge.setMode("")
             self._bridge.appendLog("[INFO] Отключено.")
             self._timer.stop()
+            self._save_current_state()
 
     def _on_vpn_stopped(self):
         try:
@@ -778,17 +858,18 @@ Exe: {Path(sys.executable)}
         except Exception as exc:
             self._bridge.appendLog(f"[WARN] _on_vpn_stopped: {exc}")
         finally:
-            self._conn_mode = None
+            with self._state_lock:
+                self._conn_mode = None
             self._bridge.appendLog("[INFO] VPN-процесс завершён.")
             self._timer.stop()
+            self._save_current_state()
 
     def _update_status(self, connected: bool):
         self._connected = connected
         self._bridge.setStatus(connected)
 
     def _reset_traffic_counters(self):
-        """Запоминает текущее значение системных счётчиков трафика — от него
-        будем отсчитывать «получено/отправлено» с момента подключения."""
+        """Запоминает текущее значение системных счётчиков трафика."""
         self._net_baseline = None
         if psutil is not None:
             try:
@@ -819,7 +900,7 @@ Exe: {Path(sys.executable)}
         })
 
     # ------------------------------------------------------------------
-    # Прокси / DNS  (без изменений относительно проверенной версии)
+    # Прокси / DNS
     # ------------------------------------------------------------------
     @staticmethod
     def _set_proxy(enable: bool):
@@ -839,8 +920,8 @@ Exe: {Path(sys.executable)}
             pass
         try:
             wininet = ctypes.windll.wininet
-            wininet.InternetSetOptionW(None, 39, None, 0)  # SETTINGS_CHANGED
-            wininet.InternetSetOptionW(None, 37, None, 0)  # REFRESH
+            wininet.InternetSetOptionW(None, 39, None, 0)
+            wininet.InternetSetOptionW(None, 37, None, 0)
         except Exception:
             pass
         try:
@@ -992,6 +1073,7 @@ Exe: {Path(sys.executable)}
                     pass
             self._timer.stop()
             self._ping_timer.stop()
+            self._save_current_state()
             event.accept()
 
     @staticmethod
@@ -1010,7 +1092,6 @@ def main():
     _install_crash_safety_net()
     _ensure_admin()
 
-    # Тоже обязательно ДО создания QApplication (второе требование QtWebEngine).
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
 
     app = QApplication(sys.argv)
