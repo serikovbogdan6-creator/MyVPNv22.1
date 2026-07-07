@@ -36,6 +36,7 @@ class VPNBridgeAPI(QObject):
         super().__init__()
         self.servers: list[dict] = []
         self.selected_index: int = -1
+        self._last_selected_host: str = ""  # Сохраняем хост выбранного сервера
 
     # ------------------------------------------------------------------
     # Вызывается из JavaScript
@@ -44,6 +45,7 @@ class VPNBridgeAPI(QObject):
     def selectServer(self, index: int):
         if 0 <= index < len(self.servers):
             self.selected_index = index
+            self._last_selected_host = self.servers[index].get("host", "")
 
     @pyqtSlot()
     def connectSelected(self):
@@ -91,7 +93,18 @@ class VPNBridgeAPI(QObject):
         self.metricsUpdated.emit(json.dumps(metrics, ensure_ascii=False))
 
     def setServers(self, servers: list[dict]):
+        """Обновляет список серверов, сохраняя выбранный сервер если возможно."""
         self.servers = servers
+        
+        # Пытаемся сохранить выбранный сервер по хосту
+        if self._last_selected_host:
+            for idx, srv in enumerate(servers):
+                if srv.get("host") == self._last_selected_host:
+                    self.selected_index = idx
+                    self.serversUpdated.emit(json.dumps(servers, ensure_ascii=False))
+                    return
+        
+        # Если сервер не найден, выбираем первый
         self.selected_index = 0 if servers else -1
         self.serversUpdated.emit(json.dumps(servers, ensure_ascii=False))
 
